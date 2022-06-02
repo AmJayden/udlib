@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <string_view>
 #include <fstream>
+#include <unordered_map>
 
 #include <Windows.h>
 #include <winternl.h>
@@ -19,14 +20,17 @@
 #endif
 
 #define ud_encode_c( str ) ud::rot::decode( ud::rot::rot_t<str>{ } ).data
-#define ud_encode( str ) std::string_view{ ud_encode_c( str ) }
+#define ud_encode( str ) std::string_view( ud::rot::decode( ud::rot::rot_t<str>{ } ) )
 
 #define ud_xorstr_c( str ) ud::xorstr::decrypt( ud::xorstr::xorstr_t< str, __COUNTER__ + 1 ^ 0x90 >{ } ).data
-#define ud_xorstr( str ) std::string_view{ ud_xorstr_c( str ) }
+#define ud_xorstr( str ) std::string_view{ ud::xorstr::decrypt( ud::xorstr::xorstr_t< str, __COUNTER__ + 1 ^ 0x90 >{ } ) }
 
 #define ud_stack_str( str ) ud::details::comp_string_t{ str }.data
 
-// settings defined below, preprocessed due to compiler errors present even with "if constexpr"
+#define ud_import( mod, func )	reinterpret_cast< decltype( &func ) >( ud::lazy_import::find_module_export< TEXT( mod ), #func >( ) )
+#define ud_first_import( func ) reinterpret_cast< decltype( &func ) >( ud::lazy_import::find_first_export< #func >( ) )
+
+// preprocessed settings due to MSVC (not clang or gcc) throwing errors even in `if constexpr` bodies
 #define UD_USE_SEH false
 
 namespace ud
@@ -43,7 +47,7 @@ namespace ud
 
 		struct LDR_DATA_TABLE_ENTRY32
 		{
-			LIST_ENTRY InLoadOrderLinks;
+			LIST_ENTRY in_load_order_links;
 
 			std::uint8_t pad[ 16 ];
 			std::uintptr_t dll_base;
@@ -56,7 +60,7 @@ namespace ud
 
 		struct LDR_DATA_TABLE_ENTRY64
 		{
-			LIST_ENTRY InLoadOrderLinks;
+			LIST_ENTRY in_load_order_links;
 			LIST_ENTRY dummy_0;
 			LIST_ENTRY dummy_1;
 
@@ -71,7 +75,7 @@ namespace ud
 			UNICODE_STRING base_name;
 		};
 
-#ifdef _M_X64
+#if defined( _M_X64 )
 		using LDR_DATA_TABLE_ENTRY = LDR_DATA_TABLE_ENTRY64;
 #else
 		using LDR_DATA_TABLE_ENTRY = LDR_DATA_TABLE_ENTRY32;
@@ -87,6 +91,29 @@ namespace ud
 			consteval comp_string_t( const char( &str )[ sz ] )
 			{
 				std::copy_n( str, sz, data );
+			}
+
+			constexpr operator std::string_view( ) const
+			{
+				return { data, size };
+			}
+		};
+
+		template < std::size_t sz >
+		struct wcomp_string_t
+		{
+			std::size_t size = sz;
+			wchar_t data[ sz ]{ };
+
+			wcomp_string_t( ) = default;
+			consteval wcomp_string_t( const wchar_t( &str )[ sz ] )
+			{
+				std::copy_n( str, sz, data );
+			}
+
+			constexpr operator std::wstring_view( ) const
+			{
+				return { data, size };
 			}
 		};
 
@@ -137,70 +164,239 @@ namespace ud
 		}
 	}
 
-	inline std::optional< std::string > get_dialogue_path( const std::string_view type = "", const HWND wnd = nullptr )
+	namespace rot
 	{
-		OPENFILENAMEA ofn;
-		char path[ MAX_PATH ]{ };
+		template < details::comp_string_t str >
+		struct rot_t
+		{
+			char rotted[ str.size ];
 
-		ZeroMemory( &ofn, sizeof( ofn ) );
-		ofn.lStructSize = sizeof( ofn );
-		ofn.hwndOwner = wnd;
-		ofn.lpstrFilter = type.empty( ) ? "All Files (*.*)\0*.*\0" : type.data( );
-		ofn.lpstrFile = path;
-		ofn.nMaxFile = MAX_PATH;
-		ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_HIDEREADONLY;
+			consteval const char* encoded( ) const
+			{
+				return rotted;
+			}
 
-		if ( GetOpenFileNameA( &ofn ) )
-			return { path };
+			consteval rot_t( )
+			{
+				for ( auto i = 0u; i < str.size; ++i )
+				{
+					const auto c = str.data[ i ];
+					const auto set = c >= 'A' && c <= 'Z' ? 'A' : c >= 'a' && c <= 'z' ? 'a' : c;
 
-		return std::nullopt;
+					if ( set == 'a' || set == 'A' )
+						rotted[ i ] = ( c - set - 13 + 26 ) % 26 + set;
+
+					else
+						rotted[ i ] = c;
+				}
+			}
+		};
+
+		template < details::comp_string_t str >
+		UD_FORCEINLINE details::comp_string_t< str.size > decode( rot_t< str > encoded )
+		{
+			details::comp_string_t< str.size > result{ };
+
+			for ( auto i = 0u; i < str.size; ++i )
+			{
+				const auto c = encoded.rotted[ i ];
+				const auto set = c >= 'A' && c <= 'Z' ? 'A' : c >= 'a' && c <= 'z' ? 'a' : c;
+
+				if ( set == 'a' || set == 'A' )
+					result.data[ i ] = ( c - set - 13 + 26 ) % 26 + set;
+
+				else
+					result.data[ i ] = c;
+			}
+
+			return result;
+		}
 	}
 
-	inline std::optional< std::string > read_file( const std::string_view path )
+	namespace fnv
 	{
-		std::ifstream file( path.data( ) );
-		if ( !file.is_open( ) )
-			return std::nullopt;
+		inline constexpr std::uint32_t fnv_1a( const char* const str, const std::size_t size )
+		{
+			constexpr auto prime = 16777619u;
 
-		std::string content;
-		file.seekg( 0, std::ios::end );
-		content.reserve( file.tellg( ) );
-		file.seekg( 0, std::ios::beg );
+			std::uint32_t hash = 2166136261;
 
-		content.assign( std::istreambuf_iterator< char >( file ), std::istreambuf_iterator< char >( ) );
-		return content;
+			for ( auto i = 0u; i < size; ++i )
+			{
+				hash ^= str[ i ];
+				hash *= prime;
+			}
+
+			return hash;
+		}
+
+		inline constexpr std::uint32_t fnv_1a( const wchar_t* const str, const std::size_t size )
+		{
+			constexpr auto prime = 16777619u;
+
+			std::uint32_t hash = 2166136261;
+
+			for ( auto i = 0u; i < size; ++i )
+			{
+				hash ^= static_cast< char >( str[ i ] );
+				hash *= prime;
+			}
+
+			return hash;
+		}
+
+		inline constexpr std::uint32_t fnv_1a( const std::wstring_view str )
+		{
+			return fnv_1a( str.data( ), str.size( ) );
+		}
+
+		inline constexpr std::uint32_t fnv_1a( const std::string_view str )
+		{
+			return fnv_1a( str.data( ), str.size( ) );
+		}
+
+		template < details::comp_string_t str >
+		consteval std::uint32_t fnv_1a( )
+		{
+			return fnv_1a( str.data, str.size );
+		}
+
+		template < details::wcomp_string_t str >
+		consteval std::uint32_t fnv_1a( )
+		{
+			return fnv_1a( str.data, str.size );
+		}
 	}
 
-	inline std::optional< std::pair< std::string, std::string > > read_dialogue( const std::string_view type = "", const HWND wnd = nullptr )
+	namespace xorstr
 	{
-		const auto path = get_dialogue_path( type, wnd );
-		if ( !path )
-			return std::nullopt;
+		template < details::comp_string_t str, std::uint32_t key_multiplier >
+		struct xorstr_t
+		{
+			char xored[ str.size ];
 
-		const auto content = read_file( *path );
-		if ( !content )
-			return std::nullopt;
+			consteval std::uint64_t xor_key( ) const
+			{
+				return details::recursive_random< key_multiplier >( );
+			}
 
-		return std::make_pair( *path, *content );
+			consteval xorstr_t( )
+			{
+				for ( auto i = 0u; i < str.size; ++i )
+					xored[ i ] = str.data[ i ] ^ xor_key( );
+			}
+		};
+
+		template < details::comp_string_t str, std::uint32_t key_multiplier >
+		UD_FORCEINLINE details::comp_string_t< str.size > decrypt( xorstr_t< str, key_multiplier > enc )
+		{
+			details::comp_string_t< str.size > result{ };
+
+			for ( auto i = 0u; i < str.size; ++i )
+			{
+				const auto c = enc.xored[ i ];
+
+				result.data[ i ] = c ^ enc.xor_key( );
+			}
+
+			return result;
+		}
 	}
 
-	template< typename ty >
-	std::optional< ty > get_window_prop( const HWND wnd, const char* const prop )
+	namespace lazy_import
 	{
-		const auto allocation = GetPropA( wnd, prop );
+		UD_FORCEINLINE const std::uintptr_t get_module_handle( const std::uint64_t hash )
+		{
+#if defined( _M_X64 )
+			const auto peb = reinterpret_cast< const PEB* >( __readgsqword( 0x60 ) );
+#else
+			const auto peb = reinterpret_cast< const PEB* >( __readfsdword( 0x30 ) );
+#endif
 
-		return allocation ? std::make_optional( *reinterpret_cast< ty* >( allocation ) ) : std::nullopt;
-	}
+			const auto modules = reinterpret_cast< const LIST_ENTRY* >( peb->Ldr->InMemoryOrderModuleList.Flink );
 
-	template < typename ty >
-	void set_window_prop( const HWND wnd, const char* const prop, const ty value )
-	{
-		std::unique_ptr< void, decltype( &LocalFree ) > x = { LocalAlloc( LMEM_ZEROINIT, sizeof( ty ) ), &LocalFree };
-		if ( !x )
-			return;
+			for ( auto i = modules->Flink; i != modules; i = i->Flink )
+			{
+				const auto entry = reinterpret_cast< const details::LDR_DATA_TABLE_ENTRY* >( i );
 
-		*reinterpret_cast< ty* >( x.get( ) ) = value;
-		SetPropA( wnd, prop, x.get( ) );
+				const auto name = entry->base_name.Buffer;
+				const auto len = entry->base_name.Length;
+
+				if ( fnv::fnv_1a( static_cast< const wchar_t* >( name ), len ) == hash )
+					return entry->dll_base;
+			}
+
+			return 0;
+		}
+
+		UD_FORCEINLINE void* find_primitive_export( const std::uint64_t dll_hash, const std::uint64_t function_hash )
+		{
+			const auto module = get_module_handle( dll_hash );
+
+			if ( !module )
+				return nullptr;
+
+			const auto dos = reinterpret_cast< const IMAGE_DOS_HEADER* >( module );
+			const auto nt = reinterpret_cast< const IMAGE_NT_HEADERS* >( module + dos->e_lfanew );
+
+			const auto exports = reinterpret_cast< const IMAGE_EXPORT_DIRECTORY* >( module + nt->OptionalHeader.DataDirectory[ IMAGE_DIRECTORY_ENTRY_EXPORT ].VirtualAddress );
+
+			const auto names = reinterpret_cast< const std::uint32_t* >( module + exports->AddressOfNames );
+			const auto ordinals = reinterpret_cast< const std::uint16_t* >( module + exports->AddressOfNameOrdinals );
+			const auto functions = reinterpret_cast< const std::uint32_t* >( module + exports->AddressOfFunctions );
+
+			for ( auto i = 0u; i < exports->NumberOfNames; ++i )
+			{
+				const auto name = reinterpret_cast< const char* >( module + names[ i ] );
+				std::size_t len = 0;
+
+				for ( ; name[ len ]; ++len );
+
+				if ( fnv::fnv_1a( name, len ) == function_hash )
+					return reinterpret_cast< void* >( module + functions[ ordinals[ i ] ] );
+			}
+
+			return nullptr;
+		}
+
+		template < details::wcomp_string_t dll_name, details::comp_string_t function_name >
+		UD_FORCEINLINE void* find_module_export( )
+		{
+			return find_primitive_export( fnv::fnv_1a< dll_name >( ), fnv::fnv_1a< function_name >( ) );
+		}
+
+		template < details::comp_string_t function_name >
+		UD_FORCEINLINE void* find_first_export( )
+		{
+			constexpr auto function_hash = fnv::fnv_1a< function_name >( );
+
+#if defined( _M_X64 )
+			const auto peb = reinterpret_cast< const PEB* >( __readgsqword( 0x60 ) );
+#else
+			const auto peb = reinterpret_cast< const PEB* >( __readfsdword( 0x30 ) );
+#endif
+
+			const auto modules = reinterpret_cast< const LIST_ENTRY* >( peb->Ldr->InMemoryOrderModuleList.Flink );
+
+
+			for ( auto i = modules->Flink; i != modules; i = i->Flink )
+			{
+				const auto entry = reinterpret_cast< const details::LDR_DATA_TABLE_ENTRY* >( i );
+
+				const auto name = entry->base_name.Buffer;
+				std::size_t len = 0;
+
+				if ( !name )
+					continue;
+
+				for ( ; name[ len ]; ++len );
+
+				if ( const auto exp = find_primitive_export( fnv::fnv_1a( name, len ), function_hash ) )
+					return exp;
+			}
+
+			return nullptr;
+		}
 	}
 
 	template < typename ty = std::uintptr_t >
@@ -242,13 +438,13 @@ namespace ud
 		for ( auto i = reinterpret_cast< const std::uint8_t* >( start ); i < reinterpret_cast< const std::uint8_t* >( end ); )
 		{
 			auto found = true;
-			for ( const auto [is_wildcard, byte] : bytes )
+			for ( const auto& [ is_wildcard, byte ] : bytes )
 			{
 				++i;
-
+				
 				if ( is_wildcard )
 					continue;
-
+				
 				if ( *i != byte )
 				{
 					found = false;
@@ -257,7 +453,7 @@ namespace ud
 			}
 
 			if ( found )
-				return ty( i );
+				return ty( i - bytes.size( ) + 1 );
 		}
 
 		return std::nullopt;
@@ -317,8 +513,6 @@ namespace ud
 					return;
 				}
 			}
-
-			throw std::runtime_error( "Segment not found" );
 		}
 	};
 
@@ -381,6 +575,11 @@ namespace ud
 		std::string name;
 		std::uintptr_t start, end;
 		std::size_t size;
+
+		segment_t operator[ ]( const std::string_view segment_name ) const
+		{
+			return { reinterpret_cast< const void* >( start ), segment_name };
+		}
 
 		std::vector< export_t > get_exports( ) const
 		{
@@ -467,20 +666,20 @@ namespace ud
 					const auto name_ptr = reinterpret_cast< const char* >( start + name_table[ j ] ) + name_alignment;
 
 #if UD_USE_SEH
-						// using SEH here is not a very good solution
-						// however, it's faster than querying that page protection to see if it's readable
-						__try
-						{
-							name = name_ptr;
-						}
-						__except ( EXCEPTION_EXECUTE_HANDLER )
-						{
-							name = "";
-						}
+					// using SEH here is not a very good solution
+					// however, it's faster than querying that page protection to see if it's readable
+					__try
+					{
+						name = name_ptr;
+					}
+					__except ( EXCEPTION_EXECUTE_HANDLER )
+					{
+						name = "";
+					}
 #else
-						// runtime overhead of ~3us compared to SEH on single calls
-						// on bulk calls it can go up to ~300-500us 
-						name = is_valid_page( name_ptr, PAGE_READONLY ) ? name_ptr : "";
+					// runtime overhead of ~3us compared to SEH on single calls
+					// on bulk calls it can go up to ~300-500us 
+					name = is_valid_page( name_ptr, PAGE_READONLY ) ? name_ptr : "";
 #endif
 
 					// emplace_back doesn't allow for implicit conversion, so we have to do it manually
@@ -507,6 +706,36 @@ namespace ud
 		std::optional< ty > find_pattern( const std::string_view pattern ) const
 		{
 			return find_pattern_primitive< ty >( start, end, pattern );
+		}
+
+		std::vector< std::string_view > get_strings( const std::size_t minimum_size = 0 ) const
+		{
+			std::vector< std::string_view > result;
+
+			const auto rdata = ( *this )[ ".rdata" ];
+
+			if ( !rdata.size )
+				return { };
+
+			const auto start = reinterpret_cast< const std::uint8_t* >( rdata.start );
+			const auto end = reinterpret_cast< const std::uint8_t* >( rdata.end );
+
+			for ( auto i = start; i < end; ++i )
+			{
+				if ( *i == 0 || *i > 127 )
+					continue;
+
+				const auto str = reinterpret_cast< const char* >( i );
+				const auto sz = std::strlen( str );
+
+				if ( !sz || sz < minimum_size )
+					continue;
+
+				result.push_back( std::string_view( str, sz ) );
+				i += sz;
+			}
+
+			return result;
 		}
 
 		module_t( )
@@ -549,7 +778,7 @@ namespace ud
 	{
 		std::vector< module_t > result;
 
-#ifdef _M_X64
+#if defined( _M_X64 )
 		const auto peb = reinterpret_cast< const PEB* >( __readgsqword( 0x60 ) );
 #else
 		const auto peb = reinterpret_cast< const PEB* >( __readfsdword( 0x30 ) );
@@ -596,117 +825,10 @@ namespace ud
 		return std::nullopt;
 	}
 
-	namespace rot
+	template < typename rel_t, typename ty = std::uintptr_t >
+	ty calculate_relative( const std::uintptr_t address, const std::uint8_t size, const std::uint8_t offset )
 	{
-		template < details::comp_string_t str >
-		struct rot_t
-		{
-			char rotted[ str.size ];
-
-			consteval const char* encoded( ) const
-			{
-				return rotted;
-			}
-
-			consteval rot_t( )
-			{
-				for ( auto i = 0u; i < str.size; ++i )
-				{
-					const auto c = str.data[ i ];
-					const auto set = c >= 'A' && c <= 'Z' ? 'A' : c >= 'a' && c <= 'z' ? 'a' : c;
-
-					if ( set == 'a' || set == 'A' )
-						rotted[ i ] = ( c - set - 13 + 26 ) % 26 + set;
-
-					else
-						rotted[ i ] = c;
-				}
-			}
-		};
-
-		template < details::comp_string_t str >
-		UD_FORCEINLINE details::comp_string_t< str.size > decode( rot_t< str > encoded )
-		{
-			details::comp_string_t< str.size > result{ };
-
-			for ( auto i = 0u; i < str.size; ++i )
-			{
-				const auto c = encoded.rotted[ i ];
-				const auto set = c >= 'A' && c <= 'Z' ? 'A' : c >= 'a' && c <= 'z' ? 'a' : c;
-
-				if ( set == 'a' || set == 'A' )
-					result.data[ i ] = ( c - set - 13 + 26 ) % 26 + set;
-
-				else
-					result.data[ i ] = c;
-			}
-
-			return result;
-		}
-	}
-
-	namespace fnv
-	{
-		inline constexpr std::uint32_t fnv_1a( const char* const str, const std::size_t size )
-		{
-			constexpr auto prime = 16777619u;
-
-			std::uint32_t hash = 2166136261;
-
-			for ( auto i = 0u; i < size; ++i )
-			{
-				hash ^= str[ i ];
-				hash *= prime;
-			}
-
-			return hash;
-		}
-
-		inline constexpr std::uint32_t fnv_1a( const std::string_view str )
-		{
-			return fnv_1a( str.data( ), str.size( ) );
-		}
-
-		template < details::comp_string_t str >
-		consteval std::uint32_t fnv_1a( )
-		{
-			return fnv_1a( str.data, str.size );
-		}
-	}
-
-	namespace xorstr
-	{
-		template < details::comp_string_t str, std::uint32_t key_multiplier >
-		struct xorstr_t
-		{
-			char xored[ str.size ];
-
-			consteval std::uint64_t xor_key( ) const
-			{
-				return details::recursive_random< key_multiplier >( );
-			}
-
-			consteval xorstr_t( )
-			{
-				for ( auto i = 0u; i < str.size; ++i )
-					xored[ i ] = str.data[ i ] ^ xor_key( );
-			}
-		};
-
-		template < details::comp_string_t str, std::uint32_t key_multiplier >
-		UD_FORCEINLINE details::comp_string_t< str.size > decrypt( xorstr_t< str, key_multiplier > enc )
-		{
-			details::comp_string_t< str.size > result{ };
-
-			for ( auto i = 0u; i < str.size; ++i )
-			{
-				const auto c = enc.xored[ i ];
-
-				result.data[ i ] = c ^ enc.xor_key( );
-			}
-
-			return result;
-		}
+		return ty( address + *reinterpret_cast< rel_t* >( address + offset ) + size );
 	}
 }
 
