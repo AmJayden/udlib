@@ -10,6 +10,6 @@
 | shellcode wrappers                              | ✅ |
 | constexpr emittion                              | ✅ (clang only) |
 | constexpr fnv-1a hashing                        | ✅ |
-| lazy importer                                   | ❌ |
+| lazy importer                                   |  |
 | disassembler engine                             | ❌ |
 | memory scanning utility                         | ❌ |
