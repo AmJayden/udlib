@@ -12,7 +12,9 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <concepts>
 #include <tlhelp32.h>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 #include <winerror.h>
@@ -523,6 +525,11 @@ namespace ud
         std::optional< ty > find_pattern( const std::string_view pattern ) const
         {
             return find_pattern_primitive< ty >( start, end, pattern );
+        }
+
+        template < std::integral T > bool contains( T address )
+        {
+            return address >= start && address <= end;
         }
 
         explicit segment_t( const std::string_view segment_name )
